@@ -1,7 +1,6 @@
 """
-Нейтріко (Neutreeko) — структура гри (версія 3, гра для двох гравців).
-Реалізовано: дизайн, правила, ходи та гра для двох реальних гравців.
-ШІ та гра проти комп'ютера поки що не реалізовані (pass).
+Нейтріко (Neutreeko) — структура гри.
+Лише класи, властивості та методи; логіка поки не реалізована.
 
 Правила (коротко):
 - дошка 5x5, у кожного гравця по 3 фішки;
@@ -69,11 +68,6 @@ DIFFICULTY_NAMES = {
     Difficulty.MEDIUM: "Середній",
     Difficulty.HARD: "Складний",
 }
-MODE_NAMES = {
-    GameMode.HUMAN_VS_AI: "Гравець проти комп'ютера",
-    GameMode.HUMAN_VS_HUMAN: "Двоє гравців",
-}
-
 RESULT_TEXTS = {
     GameStatus.BLACK_WON: "Перемогли чорні!",
     GameStatus.WHITE_WON: "Перемогли білі!",
@@ -164,7 +158,7 @@ class Board:
         self.grid[move.end.row][move.end.col] = color
 
     def undo_move(self, move: Move) -> None:
-        """Скасовує хід."""
+        """Скасовує хід (потрібно для пошуку ШІ)."""
         color = self.grid[move.end.row][move.end.col]
         self.grid[move.end.row][move.end.col] = None
         self.grid[move.start.row][move.start.col] = color
@@ -254,7 +248,6 @@ class Game:
         self.move_history: list[Move] = []
         self.position_counts: dict[tuple, int] = {}
         self.winning_line: list[Position] = []
-        self.new_game()
 
     def new_game(self) -> None:
         """Починає нову партію."""
@@ -327,7 +320,7 @@ class Game:
         return self.status != GameStatus.IN_PROGRESS
 
     def copy(self) -> Game:
-        """Незалежна копія партії (для ШІ)."""
+        """Незалежна копія партії (для ШІ, що думає в окремому потоці)."""
         g = Game(self.mode)
         g.board = self.board.copy()
         g.current_color = self.current_color
@@ -354,8 +347,57 @@ class Game:
 # ======================================================================
 
 
+class SearchTimeout(Exception):
+    """Вичерпано ліміт часу пошуку (внутрішній сигнал для ітеративного поглиблення)."""
+
+
+def _build_search_tables():
+    """Попередньо обчислені таблиці для швидкого перебору (клітинка = рядок*5 + стовпець)."""
+    n = BOARD_SIZE
+    rays = []  # rays[клітинка] -> список променів (по одному на напрямок)
+    for r in range(n):
+        for c in range(n):
+            cell_rays = []
+            for dr, dc in DIRECTIONS:
+                ray, rr, cc = [], r + dr, c + dc
+                while 0 <= rr < n and 0 <= cc < n:
+                    ray.append(rr * n + cc)
+                    rr, cc = rr + dr, cc + dc
+                if ray:
+                    cell_rays.append(tuple(ray))
+            rays.append(tuple(cell_rays))
+
+    windows = []  # усі можливі «трійки в ряд» (48 штук)
+    for r in range(n):
+        for c in range(n):
+            for dr, dc in ((0, 1), (1, 0), (1, 1), (1, -1)):
+                r2, c2 = r + 2 * dr, c + 2 * dc
+                if 0 <= r2 < n and 0 <= c2 < n:
+                    windows.append((r * n + c, (r + dr) * n + c + dc, r2 * n + c2))
+
+    by_cell = [[] for _ in range(n * n)]
+    for w in windows:
+        for cell in w:
+            by_cell[cell].append(w)
+    return tuple(rays), tuple(windows), tuple(tuple(x) for x in by_cell)
+
+
+RAYS, WINDOWS, WINDOWS_BY_CELL = _build_search_tables()
+_COLOR_BY_VALUE = {0: None, 1: PlayerColor.BLACK, 2: PlayerColor.WHITE}
+INF = 10**9
+_EXACT, _LOWER, _UPPER = 0, 1, 2  # типи записів таблиці транспозицій
+
+
 class AIStrategy(ABC):
-    """Базова стратегія ШІ."""
+    """Базова стратегія ШІ + спільні допоміжні функції.
+
+    Для швидкості пошук працює не з об'єктами Board, а з плоским списком
+    `cells` із 25 чисел: 0 — порожньо, 1 — чорна фішка, 2 — біла фішка.
+    Клітинка = рядок * 5 + стовпець; хід = пара (звідки, куди).
+    """
+
+    WIN_SCORE = 100_000
+    LINE_WEIGHTS = (0, 1, 12, 100)  # «вартість» лінії з 0/1/2/3 власними фішками
 
     def __init__(self, color: PlayerColor) -> None:
         self.color: PlayerColor = color
@@ -365,48 +407,345 @@ class AIStrategy(ABC):
         """Обирає хід для поточної позиції."""
         pass
 
-    def evaluate(self, board: Board, color: PlayerColor) -> int:
-        """Евристична оцінка позиції з погляду гравця."""
-        pass
+    # ---------------- допоміжні функції ----------------
+    @staticmethod
+    def board_to_cells(board: Board) -> list[int]:
+        n = BOARD_SIZE
+        cells = [0] * (n * n)
+        for r in range(n):
+            for c in range(n):
+                color = board.get(Position(r, c))
+                if color is not None:
+                    cells[r * n + c] = color.value
+        return cells
+
+    @staticmethod
+    def cells_to_key(cells: list[int], next_color_value: int) -> tuple:
+        """Ключ позиції у тому ж форматі, що й Game._position_key()."""
+        n = BOARD_SIZE
+        rows = tuple(
+            tuple(_COLOR_BY_VALUE[v] for v in cells[r * n : (r + 1) * n])
+            for r in range(n)
+        )
+        return rows, PlayerColor(next_color_value)
+
+    @staticmethod
+    def pair_to_move(pair: tuple[int, int]) -> Move:
+        n = BOARD_SIZE
+        a, b = pair
+        return Move(Position(a // n, a % n), Position(b // n, b % n))
+
+    @staticmethod
+    def generate_moves(cells: list[int], color: int) -> list[tuple[int, int]]:
+        """Усі ходи гравця: фішка ковзає до перешкоди в кожному з напрямків."""
+        moves = []
+        for cell in range(len(cells)):
+            if cells[cell] != color:
+                continue
+            for ray in RAYS[cell]:
+                last = -1
+                for c in ray:
+                    if cells[c]:
+                        break
+                    last = c
+                if last >= 0:
+                    moves.append((cell, last))
+        return moves
+
+    @staticmethod
+    def is_win(cells: list[int], color: int, cell: int) -> bool:
+        """Чи утворює фішка в клітинці `cell` трійку в ряд (перевіряємо лише лінії через неї)."""
+        for i, j, k in WINDOWS_BY_CELL[cell]:
+            if cells[i] == color and cells[j] == color and cells[k] == color:
+                return True
+        return False
+
+    def evaluate(self, cells: list[int], color: int) -> int:
+        """Евристична оцінка позиції з погляду гравця `color`.
+
+        Для кожної з 48 можливих ліній: якщо в ній немає фішок суперника —
+        додаємо бали за власні фішки (чим більше, тим краще); якщо немає
+        моїх — віднімаємо бали за фішки суперника.
+        """
+        opp = 3 - color
+        w = self.LINE_WEIGHTS
+        score = 0
+        for i, j, k in WINDOWS:
+            x, y, z = cells[i], cells[j], cells[k]
+            own = (x == color) + (y == color) + (z == color)
+            his = (x == opp) + (y == opp) + (z == opp)
+            if his == 0:
+                score += w[own]
+            elif own == 0:
+                score -= w[his]
+        return score
 
 
-class EasyStrategy(AIStrategy):
-    """Легкий: випадковий допустимий хід."""
+class AlphaBetaStrategy(AIStrategy):
+    """Альфа-бета відсікання (у формі negamax) — спільна основа всіх рівнів.
 
+    Особливості:
+    - на кожному вузлі спершу перевіряється виграш «в один хід»;
+    - ітеративне поглиблення з обмеженням за часом (якщо задано time_limit);
+    - таблиця транспозицій (за бажанням);
+    - впорядкування ходів для кращого відсікання;
+    - на корені: третє повторення позиції трактується як нічия (оцінка 0).
+    """
+
+    def __init__(
+        self,
+        color: PlayerColor,
+        max_depth: int,
+        time_limit: Optional[float] = None,
+        use_transposition: bool = False,
+        randomize_ties: bool = True,
+    ) -> None:
+        super().__init__(color)
+        self.max_depth: int = max_depth
+        self.time_limit: Optional[float] = time_limit
+        self.use_transposition: bool = use_transposition
+        self.randomize_ties: bool = (
+            randomize_ties  # серед рівних за оцінкою ходів вибирати довільний
+        )
+        self.transposition_table: dict = {}
+        self.deadline: Optional[float] = None
+        self.nodes: int = 0
+        self.reached_depth: int = 0
+
+    # ------------------------------------------------------------------
     def choose_move(self, game: Game) -> Move:
-        pass
+        cells = self.board_to_cells(game.board)
+        color = self.color.value
+        root_moves = self.generate_moves(cells, color)
+        if not root_moves:
+            raise ValueError("Немає допустимих ходів")
+
+        start = time.perf_counter()
+        self.nodes = 0
+        self.reached_depth = 0
+        self.transposition_table.clear()
+        ordered = list(root_moves)
+        best_moves = [root_moves[0]]
+
+        for depth in range(1, self.max_depth + 1):
+            # перша ітерація завжди завершується; далі діє обмеження за часом
+            self.deadline = (
+                start + self.time_limit if self.time_limit and depth > 1 else None
+            )
+            try:
+                scored, found, best_score = self._search_root(
+                    game, cells, color, ordered, depth
+                )
+            except SearchTimeout:
+                break
+            self.reached_depth = depth
+            best_moves = found
+            # найкращі ходи — першими в наступній ітерації
+            scored.sort(key=lambda item: item[0], reverse=True)
+            ordered = [m for _, m in scored]
+            if (
+                abs(best_score) >= self.WIN_SCORE - 1000
+            ):  # знайдено примусовий виграш/програш
+                break
+
+        chosen = random.choice(best_moves) if self.randomize_ties else best_moves[0]
+        return self.pair_to_move(chosen)
+
+    def _search_root(
+        self,
+        game: Game,
+        cells: list[int],
+        color: int,
+        moves: list[tuple[int, int]],
+        depth: int,
+    ):
+        opp = 3 - color
+        scored: list[tuple[int, tuple[int, int]]] = []
+        best_moves: list[tuple[int, int]] = []
+        best = -INF
+        for pair in moves:
+            a, b = pair
+            cells[b] = color
+            cells[a] = 0
+            if self.is_win(cells, color, b):
+                score = self.WIN_SCORE  # виграш одразу
+            elif game.position_counts.get(self.cells_to_key(cells, opp), 0) >= 2:
+                score = 0  # третє повторення = нічия
+            else:
+                # вікно (best-1, +inf) дозволяє точно виявляти рівні ходи
+                alpha = best - 1 if self.randomize_ties else best
+                score = -self._negamax(cells, opp, depth - 1, -INF, -alpha, 1)
+            cells[a] = color
+            cells[b] = 0
+
+            scored.append((score, pair))
+            if score > best:
+                best, best_moves = score, [pair]
+            elif self.randomize_ties and score == best:
+                best_moves.append(pair)
+            if score >= self.WIN_SCORE:
+                break
+        return scored, best_moves, best
+
+    # ------------------------------------------------------------------
+    def alpha_beta(
+        self,
+        cells: list[int],
+        color: int,
+        depth: int,
+        alpha: int,
+        beta: int,
+        ply: int = 0,
+    ) -> int:
+        """Публічна назва алгоритму (див. _negamax)."""
+        return self._negamax(cells, color, depth, alpha, beta, ply)
+
+    def _negamax(
+        self, cells: list[int], color: int, depth: int, alpha: int, beta: int, ply: int
+    ) -> int:
+        self.nodes += 1
+        if (
+            self.deadline is not None
+            and (self.nodes & 511) == 0
+            and time.perf_counter() > self.deadline
+        ):
+            raise SearchTimeout
+
+        moves = self.generate_moves(cells, color)
+        if not moves:
+            return -self.WIN_SCORE + ply  # немає ходів — програш
+
+        # 1) якщо є виграш в один хід — далі шукати не потрібно
+        for a, b in moves:
+            cells[b] = color
+            cells[a] = 0
+            won = self.is_win(cells, color, b)
+            cells[a] = color
+            cells[b] = 0
+            if won:
+                return self.WIN_SCORE - ply
+
+        # 2) межа глибини — евристична оцінка
+        if depth <= 0:
+            return self.evaluate(cells, color)
+
+        # 3) таблиця транспозицій
+        alpha0, beta0 = alpha, beta
+        key = None
+        tt_move = None
+        if self.use_transposition:
+            key = (bytes(cells), color)
+            entry = self.transposition_table.get(key)
+            if entry is not None:
+                e_depth, flag, e_score, e_move = entry
+                tt_move = e_move
+                if e_depth >= depth:
+                    if flag == _EXACT:
+                        return e_score
+                    if flag == _LOWER:
+                        alpha = max(alpha, e_score)
+                    else:
+                        beta = min(beta, e_score)
+                    if alpha >= beta:
+                        return e_score
+
+        if depth >= 2:
+            moves = self.order_moves(cells, moves, color, tt_move)
+
+        # 4) основний цикл з відсіканням
+        opp = 3 - color
+        best = -INF
+        best_move = None
+        for pair in moves:
+            a, b = pair
+            cells[b] = color
+            cells[a] = 0
+            score = -self._negamax(cells, opp, depth - 1, -beta, -alpha, ply + 1)
+            cells[a] = color
+            cells[b] = 0
+            if score > best:
+                best, best_move = score, pair
+            if best > alpha:
+                alpha = best
+            if alpha >= beta:  # відсікання
+                break
+
+        if key is not None:
+            flag = _EXACT
+            if best <= alpha0:
+                flag = _UPPER
+            elif best >= beta0:
+                flag = _LOWER
+            if len(self.transposition_table) > 400_000:
+                self.transposition_table.clear()
+            self.transposition_table[key] = (depth, flag, best, best_move)
+        return best
+
+    def order_moves(
+        self,
+        cells: list[int],
+        moves: list[tuple[int, int]],
+        color: int,
+        tt_move: Optional[tuple[int, int]] = None,
+    ) -> list[tuple[int, int]]:
+        """Спершу — хід із таблиці, потім ходи, що блокують двійки суперника
+        або підсилюють власні лінії."""
+        opp = 3 - color
+        scored = []
+        for pair in moves:
+            a, b = pair
+            s = 1_000_000 if pair == tt_move else 0
+            for w in WINDOWS_BY_CELL[b]:
+                own = his = 0
+                for c in w:
+                    if c == a:
+                        continue
+                    v = cells[c]
+                    if v == color:
+                        own += 1
+                    elif v == opp:
+                        his += 1
+                if his == 2:
+                    s += 20  # блокуємо майже готову лінію
+                elif his == 0:
+                    s += own * own
+            scored.append((s, pair))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return [pair for _, pair in scored]
 
 
-class MediumStrategy(AIStrategy):
-    """Середній: minimax на малу глибину."""
+class EasyStrategy(AlphaBetaStrategy):
+    """Легкий: «жадібний» ШІ. Дивиться лише на один хід уперед: забирає
+    миттєву перемогу, уникає ходу, після якого суперник виграє одразу,
+    інакше вибирає хід із найкращою оцінкою позиції. Не випадковий."""
+
+    def __init__(self, color: PlayerColor) -> None:
+        super().__init__(color, max_depth=1, randomize_ties=True)
+
+
+class MediumStrategy(AlphaBetaStrategy):
+    """Середній: альфа-бета відсікання на малу глибину (без обмеження часу)."""
 
     def __init__(self, color: PlayerColor, depth: int = 3) -> None:
-        super().__init__(color)
+        super().__init__(color, max_depth=depth, randomize_ties=True)
         self.depth: int = depth
 
-    def choose_move(self, game: Game) -> Move:
-        pass
 
-    def minimax(self, game: Game, depth: int, maximizing: bool) -> int:
-        """Рекурсивний пошук minimax."""
-        pass
+class HardStrategy(AlphaBetaStrategy):
+    """Складний: альфа-бета з ітеративним поглибленням, таблицею транспозицій,
+    впорядкуванням ходів та обмеженням часу на хід."""
 
-
-class HardStrategy(AIStrategy):
-    """Складний: alpha-beta відсікання на більшу глибину."""
-
-    def __init__(self, color: PlayerColor, depth: int = 6) -> None:
-        super().__init__(color)
+    def __init__(
+        self, color: PlayerColor, depth: int = 10, time_limit: float = 4.0
+    ) -> None:
+        super().__init__(
+            color,
+            max_depth=depth,
+            time_limit=time_limit,
+            use_transposition=True,
+            randomize_ties=False,
+        )
         self.depth: int = depth
-
-    def choose_move(self, game: Game) -> Move:
-        pass
-
-    def alpha_beta(
-        self, game: Game, depth: int, alpha: int, beta: int, maximizing: bool
-    ) -> int:
-        """Рекурсивний пошук з альфа-бета відсіканням."""
-        pass
 
 
 class AIStrategyFactory:
@@ -414,7 +753,11 @@ class AIStrategyFactory:
 
     @staticmethod
     def create(difficulty: Difficulty, color: PlayerColor) -> AIStrategy:
-        pass
+        if difficulty == Difficulty.EASY:
+            return EasyStrategy(color)
+        if difficulty == Difficulty.MEDIUM:
+            return MediumStrategy(color)
+        return HardStrategy(color)
 
 
 # ======================================================================
@@ -445,16 +788,16 @@ class AIPlayer(Player):
     """Комп'ютер — хід обирає стратегія."""
 
     def __init__(self, color: PlayerColor, difficulty: Difficulty) -> None:
-        super().__init__(color, "Комп'ютер")
+        super().__init__(color, f"Комп'ютер: {DIFFICULTY_NAMES[difficulty]}")
         self.difficulty: Difficulty = difficulty
-        self.strategy: Optional[AIStrategy] = None
+        self.strategy: AIStrategy = AIStrategyFactory.create(difficulty, color)
 
     def is_human(self) -> bool:
         return False
 
     def get_move(self, game: Game) -> Move:
         """Запитує хід у стратегії."""
-        pass
+        return self.strategy.choose_move(game)
 
 
 # ======================================================================
@@ -463,20 +806,16 @@ class AIPlayer(Player):
 
 
 class GameController:
-    """Зв'язує модель (Game), гравців та інтерфейс (View).
-
-    У версії 3 працює гра для двох реальних гравців.
-    Гра проти комп'ютера з'явиться у наступній версії.
-    """
+    """Зв'язує модель (Game), гравців та інтерфейс (View)."""
 
     def __init__(self, view: "MainWindow") -> None:
         self.view: "MainWindow" = view
         self.game: Optional[Game] = None
         self.players: dict[PlayerColor, Player] = {}
-        self.mode: GameMode = GameMode.HUMAN_VS_HUMAN
         self.difficulty: Difficulty = Difficulty.EASY
-        self.human_color: PlayerColor = PlayerColor.BLACK
         self.selected_position: Optional[Position] = None
+        self.ai_thinking: bool = False
+        self.ai_min_delay: float = 0.4  # мінімальна «пауза на роздуми», с
 
     def start_new_game(
         self,
@@ -484,26 +823,32 @@ class GameController:
         difficulty: Difficulty,
         human_color: PlayerColor = PlayerColor.BLACK,
     ) -> None:
-        """Створює гравців і нову партію, відкриває ігрове поле."""
-        if mode == GameMode.HUMAN_VS_AI:
-            self.view.show_message(
-                "Скоро",
-                "Гра проти комп'ютера ще не реалізована.\n"
-                "Оберіть режим «Двоє гравців».",
-            )
-            return
-
-        self.mode = mode
+        """Створює гравців і нову партію."""
         self.difficulty = difficulty
-        self.human_color = human_color
         self.selected_position = None
-        self.players = {
-            PlayerColor.BLACK: HumanPlayer(PlayerColor.BLACK, "Гравець 1"),
-            PlayerColor.WHITE: HumanPlayer(PlayerColor.WHITE, "Гравець 2"),
-        }
+        self.ai_thinking = False
+
+        if mode == GameMode.HUMAN_VS_AI:
+            ai_color = (
+                PlayerColor.WHITE
+                if human_color == PlayerColor.BLACK
+                else PlayerColor.BLACK
+            )
+            self.players = {
+                human_color: HumanPlayer(human_color, "Ви"),
+                ai_color: AIPlayer(ai_color, difficulty),
+            }
+        else:
+            self.players = {
+                PlayerColor.BLACK: HumanPlayer(PlayerColor.BLACK, "Гравець 1"),
+                PlayerColor.WHITE: HumanPlayer(PlayerColor.WHITE, "Гравець 2"),
+            }
+
         self.game = Game(mode)
+        self.game.new_game()
         self.view.show_game()
         self.view.refresh_board(self.game)
+        self.request_ai_move()  # якщо першим ходить комп'ютер
 
     def on_cell_clicked(self, pos: Position) -> None:
         """Обробка кліку: вибір фішки або виконання ходу."""
@@ -511,7 +856,7 @@ class GameController:
         if game is None or game.is_over():
             return
         if not self.players[game.current_color].is_human():
-            return
+            return  # зараз хід комп'ютера
         if game.board.get(pos) == game.current_color:
             if self.selected_position == pos:  # повторний клік — скасувати вибір
                 self.deselect()
@@ -536,7 +881,7 @@ class GameController:
         canvas.highlight_cells([])
 
     def try_move(self, move: Move) -> None:
-        """Спроба виконати хід."""
+        """Спроба виконати хід людини."""
         if self.game.make_move(move):
             self.selected_position = None
             self.finish_turn()
@@ -544,8 +889,51 @@ class GameController:
             self.deselect()  # клік не по допустимій клітинці
 
     def request_ai_move(self) -> None:
-        """Запускає хід комп'ютера (буде у наступній версії)."""
-        pass
+        """Запускає хід комп'ютера (бажано з невеликою затримкою, after())."""
+        game = self.game
+        if game is None or game.is_over() or self.ai_thinking:
+            return
+        player = self.players[game.current_color]
+        if player.is_human():
+            return
+
+        self.ai_thinking = True
+        self.view.game_frame.update_status("Комп'ютер думає…")
+        snapshot = game.copy()
+        result: dict = {}
+
+        def worker() -> None:
+            try:
+                result["move"] = player.get_move(snapshot)
+            except Exception as error:  # помилка ШІ не повинна «вішати» гру
+                result["error"] = error
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        self._poll_ai_move(game, thread, result, time.monotonic())
+
+    def _poll_ai_move(
+        self, game: Game, thread: threading.Thread, result: dict, started: float
+    ) -> None:
+        """Чекає на хід ШІ, не блокуючи інтерфейс; виконує його в головному потоці."""
+        if self.game is not game:  # користувач почав нову партію
+            return
+        if self.view.game_frame is None:  # користувач вийшов у меню
+            self.ai_thinking = False
+            return
+        if thread.is_alive() or time.monotonic() - started < self.ai_min_delay:
+            self.view.after(
+                50, lambda: self._poll_ai_move(game, thread, result, started)
+            )
+            return
+        self.ai_thinking = False
+        move = result.get("move")
+        if move is None:
+            self.view.show_message(
+                "Помилка", f"ШІ не зміг зробити хід: {result.get('error')}"
+            )
+            return
+        self.try_move(move)
 
     def finish_turn(self) -> None:
         """Оновлює інтерфейс, перевіряє кінець гри, передає хід."""
@@ -565,8 +953,13 @@ class GameController:
         self.view.show_message("Кінець гри", RESULT_TEXTS[game.status])
 
     def restart(self) -> None:
-        """Нова партія з поточними налаштуваннями."""
-        self.start_new_game(self.mode, self.difficulty, self.human_color)
+        if self.game is None:
+            return
+        mode = self.game.mode
+        human_color = next(
+            (c for c, p in self.players.items() if p.is_human()), PlayerColor.BLACK
+        )
+        self.start_new_game(mode, self.difficulty, human_color)
 
 
 # ======================================================================
@@ -830,7 +1223,6 @@ class BoardCanvas(tk.Canvas):
         )
 
     def clear_highlights(self) -> None:
-        """Прибирає все підсвічування."""
         self.selected = None
         self.highlighted = []
         self.winning_line = []
@@ -910,7 +1302,7 @@ class MenuFrame(tk.Frame):
         super().__init__(master, bg=UI_BG, padx=50, pady=30)
         self.on_start = on_start
         self.difficulty_var: tk.IntVar = tk.IntVar(value=Difficulty.EASY.value)
-        self.mode_var: tk.IntVar = tk.IntVar(value=GameMode.HUMAN_VS_HUMAN.value)
+        self.mode_var: tk.IntVar = tk.IntVar(value=GameMode.HUMAN_VS_AI.value)
         self.color_var: tk.IntVar = tk.IntVar(value=PlayerColor.BLACK.value)
         self.ai_only_widgets: list[tk.Widget] = []
         self.build_widgets()
@@ -945,7 +1337,6 @@ class MenuFrame(tk.Frame):
                 self.ai_only_widgets.append(rb)
 
     def build_widgets(self) -> None:
-        """Створює елементи меню."""
         tk.Label(
             self, text="НЕЙТРІКО", font=("Verdana", 26, "bold"), bg=UI_BG, fg=UI_FG
         ).pack(pady=(0, 6))
@@ -957,11 +1348,8 @@ class MenuFrame(tk.Frame):
             "Режим гри",
             self.mode_var,
             [
-                (
-                    MODE_NAMES[GameMode.HUMAN_VS_AI] + " (скоро)",
-                    GameMode.HUMAN_VS_AI.value,
-                ),
-                (MODE_NAMES[GameMode.HUMAN_VS_HUMAN], GameMode.HUMAN_VS_HUMAN.value),
+                ("Гравець проти комп'ютера", GameMode.HUMAN_VS_AI.value),
+                ("Двоє гравців", GameMode.HUMAN_VS_HUMAN.value),
             ],
         )
         self._section(
@@ -1007,9 +1395,8 @@ class GameFrame(tk.Frame):
         self.build_widgets()
 
     def build_widgets(self) -> None:
-        """Створює елементи екрана гри."""
         self.turn_label = tk.Label(
-            self, text="НЕЙТРІКО", font=("Verdana", 14, "bold"), bg=UI_BG, fg=UI_FG
+            self, text="", font=("Verdana", 14, "bold"), bg=UI_BG, fg=UI_FG
         )
         self.turn_label.pack(pady=(0, 10))
 
@@ -1031,15 +1418,12 @@ class GameFrame(tk.Frame):
         )
 
     def update_turn(self, player: Player) -> None:
-        """Показує, чий зараз хід."""
         self.turn_label.config(text=f"Хід: {COLOR_NAMES[player.color]} ({player.name})")
 
     def update_status(self, text: str) -> None:
-        """Оновлює рядок стану."""
         self.status_label.config(text=text)
 
     def show_game_over(self, status: GameStatus) -> None:
-        """Показує результат гри."""
         self.update_status(RESULT_TEXTS.get(status, ""))
 
 
@@ -1072,21 +1456,18 @@ class MainWindow(tk.Tk):
         self.geometry(f"+{x}+{y}")
 
     def show_menu(self) -> None:
-        """Показує головне меню."""
         self._clear()
         self.menu_frame = MenuFrame(self, on_start=self.controller.start_new_game)
         self.menu_frame.pack()
         self._center()
 
     def show_game(self) -> None:
-        """Показує екран гри."""
         self._clear()
         self.game_frame = GameFrame(self, self.controller)
         self.game_frame.pack()
         self._center()
 
     def refresh_board(self, game: Game) -> None:
-        """Оновлює відображення дошки."""
         if self.game_frame is None:
             return
         self.game_frame.board_canvas.refresh(game)
@@ -1097,7 +1478,6 @@ class MainWindow(tk.Tk):
         self.game_frame.update_status("")
 
     def show_message(self, title: str, text: str) -> None:
-        """Показує діалогове повідомлення."""
         messagebox.showinfo(title, text)
 
 
